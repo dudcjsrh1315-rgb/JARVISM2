@@ -4,7 +4,166 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>J.A.R.V.I.S. AI Control System // studyingmode.py Integrated</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com">
+        // =========================================================================
+        // 🌐 7. Firebase Realtime Database 멀티 디바이스 실시간 연동 엔진
+        //       엔드포인트: https://jarvis-70cfd-default-rtdb.firebaseio.com/jarvis_state.json
+        // =========================================================================
+        const FIREBASE_DB_URL = "https://jarvis-70cfd-default-rtdb.firebaseio.com/jarvis_state.json";
+        const CLIENT_SESSION_ID = "client_" + Math.random().toString(36).slice(2, 10);
+        let lastSyncedSignature = "";
+        let isApplyingRemoteState = false;
+        let lastHandledCommandTimestamp = 0;
+
+        function buildStateSignature(data) {
+            if (!data) return "";
+            return JSON.stringify({
+                node: data.node || null,
+                schedules: data.schedules || [],
+                isStudyActive: !!data.isStudyActive,
+                isLightOn: !!data.isLightOn,
+                currentActiveMode: data.currentActiveMode || "none",
+                remoteCmd: data.remoteCmd || null
+            });
+        }
+
+        async function pushStateToCloud(remoteCommandObj = null) {
+            if (isApplyingRemoteState) return;
+            const payload = {
+                node: JSON.parse(localStorage.getItem(STORAGE_NODE_KEY)),
+                schedules: schedules,
+                isStudyActive: isStudyActive,
+                isLightOn: isLightOn,
+                currentActiveMode: currentActiveMode,
+                remoteCmd: remoteCommandObj,
+                updatedBy: CLIENT_SESSION_ID,
+                updatedAt: Date.now()
+            };
+            lastSyncedSignature = buildStateSignature(payload);
+            try {
+                await fetch(FIREBASE_DB_URL, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+            } catch (err) {
+                console.warn("[Firebase Sync] 클라우드 업로드 실패:", err);
+            }
+        }
+
+        async function pullStateFromCloud() {
+            try {
+                const res = await fetch(FIREBASE_DB_URL, { cache: "no-store" });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data) return;
+
+                const incomingSig = buildStateSignature(data);
+                if (incomingSig === lastSyncedSignature) return;
+                lastSyncedSignature = incomingSig;
+
+                isApplyingRemoteState = true;
+                try {
+                    // 1) PANEL에서 등록된 로컬 LLM 연산 기기 동기화
+                    if (data.node) {
+                        localStorage.setItem(STORAGE_NODE_KEY, JSON.stringify(data.node));
+                        updateLoginNodePreview();
+                        if (!document.getElementById("user-dashboard").classList.contains("hidden")) {
+                            const deviceDisplay = document.getElementById("compute-device-name");
+                            const badge = document.getElementById("node-badge");
+                            const telemetryLlm = document.getElementById("telemetry-llm");
+                            if (data.node.registered) {
+                                deviceDisplay.innerText = data.node.deviceName;
+                                deviceDisplay.className = "mt-1 text-sm sm:text-base font-bold text-cyan-300 truncate";
+                                badge.innerText = "ONLINE";
+                                badge.className = "text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/60 text-emerald-300 font-bold";
+                                telemetryLlm.innerText = "CONNECTED";
+                                telemetryLlm.className = "font-mono-code text-emerald-400";
+                            }
+                        }
+                    }
+
+                    // 2) 스케줄 데이터 동기화
+                    if (Array.isArray(data.schedules)) {
+                        schedules = data.schedules;
+                        localStorage.setItem(STORAGE_SCHED_KEY, JSON.stringify(schedules));
+                        renderCalendar();
+                        renderScheduleList();
+                    }
+
+                    // 3) 조명 상태 원격 동기화
+                    if (typeof data.isLightOn === "boolean" && data.isLightOn !== isLightOn) {
+                        toggleLightMode(true);
+                    }
+
+                    // 4) 공부 모드 및 작업 모드 프리셋 원격 동기화
+                    if (data.currentActiveMode && data.currentActiveMode !== currentActiveMode && data.currentActiveMode !== "none") {
+                        activateWorkspacePreset(data.currentActiveMode);
+                    } else if (typeof data.isStudyActive === "boolean" && data.isStudyActive !== isStudyActive) {
+                        toggleStudyMode(true);
+                    }
+
+                    // 5) 원격 음성/자연어 명령 또는 이투스/EBSi 실행 트리거 동기화
+                    if (data.remoteCmd && data.remoteCmd.ts && data.remoteCmd.ts > lastHandledCommandTimestamp) {
+                        lastHandledCommandTimestamp = data.remoteCmd.ts;
+                        if (data.updatedBy !== CLIENT_SESSION_ID) {
+                            if (data.remoteCmd.type === "utterance" && data.remoteCmd.value) {
+                                handleStudyingmodeCommand(data.remoteCmd.value);
+                            } else if (data.remoteCmd.type === "etoos") {
+                                runEtoosSmartLoginOnly();
+                            } else if (data.remoteCmd.type === "ebsi") {
+                                runEbsiLoginSequence();
+                            }
+                        }
+                    }
+                } finally {
+                    isApplyingRemoteState = false;
+                }
+            } catch (err) {
+                // 네트워크 일시 오류 무시
+            }
+        }
+
+        // 주요 액션 함수 호출 시 자동으로 Firebase Realtime DB에 즉시 동기화되도록 래핑
+        ["registerCurrentDeviceAsPanel", "updateDeviceName", "toggleStudyMode", "toggleLightMode", "addScheduleItem", "deleteScheduleItem", "activateWorkspacePreset"].forEach(fnName => {
+            const origFn = window[fnName];
+            if (typeof origFn === "function") {
+                window[fnName] = function(...args) {
+                    const result = origFn.apply(this, args);
+                    pushStateToCloud();
+                    return result;
+                };
+            }
+        });
+
+        const _origHandleCmd = window.handleStudyingmodeCommand;
+        window.handleStudyingmodeCommand = function(utterance) {
+            const res = _origHandleCmd(utterance);
+            pushStateToCloud({ type: "utterance", value: utterance, ts: Date.now() });
+            return res;
+        };
+
+        const _origRunEtoos = window.runEtoosSmartLoginOnly;
+        window.runEtoosSmartLoginOnly = function() {
+            const res = _origRunEtoos();
+            pushStateToCloud({ type: "etoos", ts: Date.now() });
+            return res;
+        };
+
+        const _origRunEbsi = window.runEbsiLoginSequence;
+        window.runEbsiLoginSequence = function() {
+            const res = _origRunEbsi();
+            pushStateToCloud({ type: "ebsi", ts: Date.now() });
+            return res;
+        };
+
+        // 1.2초 주기로 실시간 클라우드 상태 폴링 및 초기 동기화 수행
+        window.addEventListener("DOMContentLoaded", () => {
+            pullStateFromCloud();
+            setInterval(pullStateFromCloud, 1200);
+        });
+
+    </script>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -2204,87 +2363,6 @@
             update();
             setInterval(update, 1000);
         }
-		// =========================================================
-// 🌐 멀티 디바이스 실시간 연동 패치 (Firebase REST Polling/Sync)
-// =========================================================
-const FIREBASE_DB_URL = "https://https://jarvis-70cfd-default-rtdb.firebaseio.com/jarvis_state.json"; 
-// 위 주소를 본인 Firebase Realtime Database 주소 끝부분에 /jarvis_state.json을 붙여서 입력
-
-let lastSyncedRaw = "";
-
-// 1) 로컬 상태가 바뀔 때 클라우드 DB로 즉시 업로드
-async function pushStateToCloud() {
-    const payload = {
-        node: JSON.parse(localStorage.getItem(STORAGE_NODE_KEY)),
-        schedules: schedules,
-        isStudyActive: isStudyActive,
-        isLightOn: isLightOn,
-        updatedAt: Date.now()
-    };
-    const raw = JSON.stringify(payload);
-    lastSyncedRaw = raw;
-    try {
-        await fetch(FIREBASE_DB_URL, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: raw
-        });
-    } catch (e) {
-        console.warn("클라우드 동기화 대기 중:", e);
-    }
-}
-
-// 2) 다른 기기에서 변경한 상태를 1.5초마다 실시간 감지하여 내 화면에 반영
-async function pullStateFromCloud() {
-    if (FIREBASE_DB_URL.includes("YOUR_DATABASE_URL")) return;
-    try {
-        const res = await fetch(FIREBASE_DB_URL);
-        const data = await res.json();
-        if (!data) return;
-
-        const incomingRaw = JSON.stringify(data);
-        if (incomingRaw === lastSyncedRaw) return; // 변경사항 없으면 무시
-        lastSyncedRaw = incomingRaw;
-
-        // 연산 기기 정보 동기화
-        if (data.node) {
-            localStorage.setItem(STORAGE_NODE_KEY, JSON.stringify(data.node));
-            updateLoginNodePreview();
-            if (!document.getElementById("user-dashboard").classList.contains("hidden")) {
-                showUserDashboard();
-            }
-        }
-        // 스케줄 동기화
-        if (data.schedules) {
-            schedules = data.schedules;
-            localStorage.setItem(STORAGE_SCHED_KEY, JSON.stringify(schedules));
-            renderCalendar();
-            renderScheduleList();
-        }
-        // 공부 모드 및 조명 상태 원격 동기화
-        if (typeof data.isStudyActive === "boolean" && data.isStudyActive !== isStudyActive) {
-            toggleStudyMode();
-        }
-        if (typeof data.isLightOn === "boolean" && data.isLightOn !== isLightOn) {
-            toggleLightMode();
-        }
-    } catch (e) {}
-}
-
-// 기존 함수 실행 시 자동으로 클라우드 업로드 트리거 연결
-["registerCurrentDeviceAsPanel", "updateDeviceName", "toggleStudyMode", "toggleLightMode", "addScheduleItem", "deleteScheduleItem"].forEach(fnName => {
-    const origFn = window[fnName];
-    if (typeof origFn === "function") {
-        window[fnName] = function(...args) {
-            const result = origFn.apply(this, args);
-            pushStateToCloud();
-            return result;
-        };
-    }
-});
-
-setInterval(pullStateFromCloud, 1500);
-pullStateFromCloud();
     </script>
 </body>
 </html>
